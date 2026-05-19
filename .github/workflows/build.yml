@@ -52,7 +52,12 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build Tauri app
+      - name: Build Tauri app on Linux
+        if: matrix.platform == 'ubuntu-24.04'
+        run: pnpm tauri build -- --bundles deb,rpm
+
+      - name: Build Tauri app on Windows and macOS
+        if: matrix.platform != 'ubuntu-24.04'
         run: pnpm tauri build
 
       - name: Upload workflow artifacts
