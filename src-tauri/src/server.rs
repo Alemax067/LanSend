@@ -6,11 +6,13 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 use tauri::AppHandle;
+use tokio::net::TcpListener;
 
 use crate::{
     config, network,
@@ -59,21 +61,72 @@ async fn run_server(app: AppHandle, transfer_state: Arc<TransferState>) -> Resul
         app,
         transfer_state,
     };
-    let ipv4_listener = bind_listener(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port))).await?;
-    let ipv6_listener = bind_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.listen_port))).await?;
+    let ipv4_listener = bind_ipv4_listener(config.listen_port).await;
+    let ipv6_listener = bind_ipv6_listener(config.listen_port).await;
 
-    let ipv4_server = axum::serve(ipv4_listener, router(state.clone()));
-    let ipv6_server = axum::serve(ipv6_listener, router(state));
-
-    tokio::try_join!(ipv4_server, ipv6_server)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    match (ipv4_listener, ipv6_listener) {
+        (Ok(ipv4_listener), Ok(ipv6_listener)) => {
+            tokio::try_join!(
+                serve_listener(ipv4_listener, state.clone()),
+                serve_listener(ipv6_listener, state),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }
+        (Ok(listener), Err(error)) | (Err(error), Ok(listener)) => {
+            eprintln!("failed to start one network listener: {error}");
+            serve_listener(listener, state)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        (Err(ipv4_error), Err(ipv6_error)) => Err(format!(
+            "端口 {} 监听失败：IPv4: {ipv4_error}; IPv6: {ipv6_error}",
+            config.listen_port
+        )),
+    }
 }
 
-async fn bind_listener(address: SocketAddr) -> Result<tokio::net::TcpListener, String> {
-    tokio::net::TcpListener::bind(address)
-        .await
-        .map_err(|error| format!("端口 {} 监听失败：{error}", address.port()))
+async fn bind_ipv4_listener(port: u16) -> Result<TcpListener, String> {
+    bind_listener(
+        Domain::IPV4,
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+        false,
+    )
+    .map_err(|error| format!("IPv4 端口 {port} 监听失败：{error}"))
+}
+
+async fn bind_ipv6_listener(port: u16) -> Result<TcpListener, String> {
+    bind_listener(
+        Domain::IPV6,
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        true,
+    )
+    .map_err(|error| format!("IPv6 端口 {port} 监听失败：{error}"))
+}
+
+fn bind_listener(domain: Domain, address: SocketAddr, only_v6: bool) -> Result<TcpListener, String> {
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|error| error.to_string())?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|error| error.to_string())?;
+    if domain == Domain::IPV6 {
+        socket
+            .set_only_v6(only_v6)
+            .map_err(|error| error.to_string())?;
+    }
+    socket
+        .bind(&address.into())
+        .map_err(|error| error.to_string())?;
+    socket.listen(1024).map_err(|error| error.to_string())?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| error.to_string())?;
+    TcpListener::from_std(socket.into()).map_err(|error| error.to_string())
+}
+
+async fn serve_listener(listener: TcpListener, state: ServerState) -> std::io::Result<()> {
+    axum::serve(listener, router(state)).await
 }
 
 fn router(state: ServerState) -> Router {
