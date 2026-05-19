@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 use tauri::AppHandle;
@@ -55,27 +55,36 @@ pub fn start_server(app: AppHandle, transfer_state: Arc<TransferState>) {
 
 async fn run_server(app: AppHandle, transfer_state: Arc<TransferState>) -> Result<(), String> {
     let config = config::load_or_create_config()?;
-    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port));
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .map_err(|error| format!("端口 {} 监听失败：{error}", config.listen_port))?;
-
     let state = ServerState {
         app,
         transfer_state,
     };
-    let app = Router::new()
+    let ipv4_listener = bind_listener(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.listen_port))).await?;
+    let ipv6_listener = bind_listener(SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.listen_port))).await?;
+
+    let ipv4_server = axum::serve(ipv4_listener, router(state.clone()));
+    let ipv6_server = axum::serve(ipv6_listener, router(state));
+
+    tokio::try_join!(ipv4_server, ipv6_server)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn bind_listener(address: SocketAddr) -> Result<tokio::net::TcpListener, String> {
+    tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("端口 {} 监听失败：{error}", address.port()))
+}
+
+fn router(state: ServerState) -> Router {
+    Router::new()
         .route("/api/v1/hello", get(hello))
         .route("/api/v1/transfer/offer", post(transfer_offer))
         .route(
             "/api/v1/transfer/:transfer_id/upload/:file_index",
             post(upload_file),
         )
-        .with_state(state);
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|error| error.to_string())
+        .with_state(state)
 }
 
 async fn hello() -> Result<Json<HelloResponse>, String> {
