@@ -70,6 +70,10 @@ fn ipv4_score(address: Ipv4Addr, interface_name: &str) -> u16 {
         0
     } else if is_private_ipv4(address) {
         100
+    } else if is_shared_ipv4(address) {
+        180
+    } else if is_benchmark_ipv4(address) {
+        450
     } else {
         200
     };
@@ -84,12 +88,12 @@ fn ipv6_score(
 ) -> u16 {
     let segments = address.segments();
     let first = segments[0];
-    let base = if (first & 0xfe00) == 0xfc00 {
+    let base = if stable_ipv6_addresses.contains(&address) {
         0
-    } else if stable_ipv6_addresses.contains(&address) {
-        100
     } else if (first & 0xe000) == 0x2000 {
-        250
+        100
+    } else if (first & 0xfe00) == 0xfc00 {
+        260
     } else if (first & 0xffc0) == 0xfe80 {
         300
     } else {
@@ -145,6 +149,16 @@ fn is_preferred_private_ipv4(address: Ipv4Addr) -> bool {
             && octets[1] != 18)
 }
 
+fn is_shared_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_benchmark_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)
+}
+
 fn interface_penalty(interface_name: &str) -> u16 {
     let lower = interface_name.to_ascii_lowercase();
     let virtual_markers = [
@@ -161,6 +175,11 @@ fn interface_penalty(interface_name: &str) -> u16 {
         "zt",
         "ham",
         "bridge",
+        "meta",
+        "hyper-v",
+        "vethernet",
+        "loopback",
+        "npcap",
     ];
 
     if virtual_markers.iter().any(|marker| lower.contains(marker)) {
