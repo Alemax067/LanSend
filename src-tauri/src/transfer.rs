@@ -15,6 +15,14 @@ use uuid::Uuid;
 
 use crate::config;
 
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardTextPayload {
+    pub text: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferFileMeta {
     pub index: u32,
@@ -28,6 +36,7 @@ pub struct TransferOffer {
     pub sender_id: String,
     pub sender_alias: String,
     pub files: Vec<TransferFileMeta>,
+    pub clipboard_text: Option<ClipboardTextPayload>,
     pub total_size: u64,
 }
 
@@ -84,8 +93,14 @@ pub async fn handle_offer(
     state: std::sync::Arc<TransferState>,
     offer: TransferOffer,
 ) -> TransferOfferResponse {
-    if offer.files.is_empty() {
-        return TransferOfferResponse::rejected("empty_files");
+    if offer.files.is_empty() && offer.clipboard_text.is_none() {
+        return TransferOfferResponse::rejected("empty_transfer");
+    }
+
+    if let Some(clipboard_text) = &offer.clipboard_text {
+        if let Err(reason) = validate_clipboard_text(clipboard_text) {
+            return TransferOfferResponse::rejected(&reason);
+        }
     }
 
     let transfer_id = offer.transfer_id;
@@ -195,6 +210,23 @@ pub async fn upload_file(
             .to_string(),
         size: written,
     })
+}
+
+pub fn validate_clipboard_text(payload: &ClipboardTextPayload) -> Result<(), String> {
+    let actual_size = payload.text.as_bytes().len();
+    if payload.text.trim().is_empty() {
+        return Err("clipboard_empty".to_string());
+    }
+
+    if actual_size > MAX_CLIPBOARD_TEXT_BYTES {
+        return Err("clipboard_too_large".to_string());
+    }
+
+    if payload.size != actual_size as u64 {
+        return Err("clipboard_size_mismatch".to_string());
+    }
+
+    Ok(())
 }
 
 pub fn inspect_files(paths: Vec<String>) -> Result<Vec<SelectedFileInfo>, String> {

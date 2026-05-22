@@ -9,8 +9,8 @@ use network::LocalAddresses;
 use peer::{AddPeerRequest, Peer};
 use std::sync::Arc;
 use transfer::{
-    SelectedFileInfo, SendFileRequest, TransferDecision, TransferFileMeta, TransferOffer,
-    TransferOfferResponse, TransferState, UploadResult,
+    ClipboardTextPayload, SelectedFileInfo, SendFileRequest, TransferDecision, TransferFileMeta,
+    TransferOffer, TransferOfferResponse, TransferState, UploadResult,
 };
 use uuid::Uuid;
 
@@ -70,14 +70,21 @@ async fn send_transfer_offer(
     port: u16,
     address_type: peer::AddressType,
     files: Vec<TransferFileMeta>,
+    clipboard_text: Option<ClipboardTextPayload>,
 ) -> Result<TransferOfferResponse, String> {
+    if let Some(clipboard_text) = &clipboard_text {
+        transfer::validate_clipboard_text(clipboard_text)?;
+    }
+
     let config = config::load_or_create_config()?;
-    let total_size = files.iter().map(|file| file.size).sum();
+    let total_size = files.iter().map(|file| file.size).sum::<u64>()
+        + clipboard_text.as_ref().map(|payload| payload.size).unwrap_or(0);
     let offer = TransferOffer {
         transfer_id: Uuid::new_v4(),
         sender_id: config.device_id.to_string(),
         sender_alias: config.alias,
         files,
+        clipboard_text,
         total_size,
     };
     let base_url = match address_type {
@@ -134,6 +141,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(transfer_state.clone())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {

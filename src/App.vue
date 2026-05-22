@@ -3,10 +3,13 @@ import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 type PeerStatus = "unknown" | "online" | "offline";
 type AddressType = "ipv4" | "ipv6";
+
+const MAX_CLIPBOARD_TEXT_BYTES = 256 * 1024;
 
 interface SystemInfo {
   os: string;
@@ -47,11 +50,17 @@ interface TransferFileMeta {
   size: number;
 }
 
+interface ClipboardTextPayload {
+  text: string;
+  size: number;
+}
+
 interface TransferOffer {
   transfer_id: string;
   sender_id: string;
   sender_alias: string;
   files: TransferFileMeta[];
+  clipboard_text: ClipboardTextPayload | null;
   total_size: number;
 }
 
@@ -64,9 +73,11 @@ interface TransferOfferResponse {
 }
 
 interface SelectedFile {
+  kind: "file" | "clipboard";
   path: string;
   name: string;
   size: number;
+  text?: string;
 }
 
 interface UploadResult {
@@ -117,6 +128,17 @@ const newPeer = reactive({
 const totalFileSize = computed(() =>
   droppedFiles.value.reduce((total, file) => total + file.size, 0),
 );
+const selectedClipboard = computed(() => droppedFiles.value.find((item) => item.kind === "clipboard"));
+const selectedFileCount = computed(() => droppedFiles.value.filter((item) => item.kind === "file").length);
+const hasClipboardSelection = computed(() => Boolean(selectedClipboard.value));
+const selectionSummary = computed(() => {
+  const clipboard = selectedClipboard.value;
+  if (clipboard) {
+    return `Clipboard Text · ${clipboard.text?.length ?? 0} characters · ${formatBytes(clipboard.size)}`;
+  }
+
+  return `${droppedFiles.value.length} file${droppedFiles.value.length === 1 ? "" : "s"} · ${formatBytes(totalFileSize.value)}`;
+});
 
 function showToast(message: string) {
   toastMessage.value = message;
@@ -145,6 +167,7 @@ async function handleDrop(event: DragEvent) {
   if (files.length > 0) {
     droppedFiles.value = await Promise.all(
       files.map(async (file) => ({
+        kind: "file",
         path: "",
         name: file.name,
         size: file.size,
@@ -156,7 +179,8 @@ async function handleDrop(event: DragEvent) {
 
 async function applyDroppedPaths(paths: string[]) {
   try {
-    droppedFiles.value = await invoke<SelectedFile[]>("inspect_files", { paths });
+    const files = await invoke<Omit<SelectedFile, "kind">[]>("inspect_files", { paths });
+    droppedFiles.value = files.map((file) => ({ ...file, kind: "file" }));
     toastMessage.value = "";
   } catch (error) {
     showToast(`Failed to read file info: ${String(error)}`);
@@ -175,20 +199,62 @@ function removeDroppedFile(index: number) {
   }
 }
 
+async function pasteClipboardText() {
+  try {
+    const text = await readText();
+    const size = new TextEncoder().encode(text).length;
+    if (text.trim().length === 0) {
+      showToast("Clipboard does not contain text.");
+      return;
+    }
+    if (size > MAX_CLIPBOARD_TEXT_BYTES) {
+      showToast(`Clipboard text is too large. Limit: ${formatBytes(MAX_CLIPBOARD_TEXT_BYTES)}.`);
+      return;
+    }
+
+    droppedFiles.value = [
+      {
+        kind: "clipboard",
+        path: "clipboard:text",
+        name: "Clipboard Text",
+        size,
+        text,
+      },
+    ];
+    toastMessage.value = "";
+  } catch (error) {
+    showToast(`Failed to read clipboard: ${String(error)}`);
+  }
+}
+
 function transferFilesMeta(): TransferFileMeta[] {
-  return droppedFiles.value.map((file, index) => ({
-    index,
-    name: file.name,
-    size: file.size,
-  }));
+  return droppedFiles.value
+    .filter((file) => file.kind === "file")
+    .map((file, index) => ({
+      index,
+      name: file.name,
+      size: file.size,
+    }));
+}
+
+function clipboardPayload(): ClipboardTextPayload | null {
+  const clipboard = selectedClipboard.value;
+  if (!clipboard?.text) return null;
+
+  return {
+    text: clipboard.text,
+    size: clipboard.size,
+  };
 }
 
 function selectedFilesRequest() {
-  return droppedFiles.value.map((file) => ({
-    path: file.path,
-    name: file.name,
-    size: file.size,
-  }));
+  return droppedFiles.value
+    .filter((file) => file.kind === "file")
+    .map((file) => ({
+      path: file.path,
+      name: file.name,
+      size: file.size,
+    }));
 }
 
 async function loadLocalState() {
@@ -397,9 +463,17 @@ async function sendOfferToPeer(peer: Peer) {
       port: peer.port,
       addressType: peer.address_type,
       files: transferFilesMeta(),
+      clipboardText: clipboardPayload(),
     });
     if (!response.accepted) {
       showToast(`Receiver declined: ${response.reason ?? "rejected"}`);
+      return;
+    }
+
+    if (hasClipboardSelection.value && selectedFileCount.value === 0) {
+      showToast("Clipboard text sent.");
+      pendingSendPeer.value = null;
+      clearFiles();
       return;
     }
 
@@ -427,7 +501,18 @@ async function sendOfferToPeer(peer: Peer) {
   }
 }
 
-async function decideIncomingOffer(accepted: boolean) {
+async function copyIncomingClipboardText() {
+  if (!pendingOffer.value?.clipboard_text) return;
+
+  try {
+    await writeText(pendingOffer.value.clipboard_text.text);
+    await decideIncomingOffer(true, "Copied clipboard text.");
+  } catch (error) {
+    showToast(`Failed to copy clipboard text: ${String(error)}`);
+  }
+}
+
+async function decideIncomingOffer(accepted: boolean, successMessage?: string) {
   if (!pendingOffer.value) return;
 
   const transferId = pendingOffer.value.transfer_id;
@@ -438,7 +523,7 @@ async function decideIncomingOffer(accepted: boolean) {
         accepted,
       },
     });
-    showToast(accepted ? "Transfer request accepted. Waiting for upload." : "Transfer request declined.");
+    showToast(successMessage ?? (accepted ? "Transfer request accepted. Waiting for upload." : "Transfer request declined."));
   } catch (error) {
     showToast(`Failed to handle transfer request: ${String(error)}`);
   } finally {
@@ -539,21 +624,30 @@ onUnmounted(() => {
           <div class="drop-core">⇪</div>
         </div>
 
-        <button v-if="droppedFiles.length > 0" class="drop-clear-button" type="button" @click="clearFiles">
-          Clear
-        </button>
+        <div class="drop-actions">
+          <button class="drop-clear-button" type="button" @click="pasteClipboardText">
+            Paste Clipboard
+          </button>
+          <button v-if="droppedFiles.length > 0" class="drop-clear-button" type="button" @click="clearFiles">
+            Clear
+          </button>
+        </div>
 
         <div class="drop-copy">
           <p class="eyebrow title-only">Drop Zone</p>
           <p v-if="droppedFiles.length > 0" class="drop-summary">
-            {{ droppedFiles.length }} file{{ droppedFiles.length === 1 ? "" : "s" }} · {{ formatBytes(totalFileSize) }}
+            {{ selectionSummary }}
           </p>
         </div>
 
         <div v-if="droppedFiles.length > 0" class="file-stack">
-          <div v-for="(file, index) in droppedFiles" :key="file.path || file.name" class="file-pill selected-file-pill">
+          <div
+            v-for="(file, index) in droppedFiles"
+            :key="file.path || file.name"
+            :class="['file-pill', 'selected-file-pill', { 'clipboard-pill': file.kind === 'clipboard' }]"
+          >
             <button class="file-remove-button" type="button" aria-label="Remove file" @click="removeDroppedFile(index)">×</button>
-            <span>{{ file.name }}</span>
+            <span>{{ file.kind === "clipboard" ? "Clipboard Text" : file.name }}</span>
             <strong>{{ formatBytes(file.size) }}</strong>
           </div>
         </div>
@@ -606,17 +700,17 @@ onUnmounted(() => {
       <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="Confirm send">
         <div class="dialog-title">
           <div>
-            <p class="eyebrow title-only">Send Files</p>
+            <p class="eyebrow title-only">{{ hasClipboardSelection ? "Send Clipboard" : "Send Files" }}</p>
           </div>
           <button class="close-button" type="button" :disabled="isSendingOffer" @click="closeSendDialog">×</button>
         </div>
 
         <p class="incoming-summary">
-          Send {{ droppedFiles.length }} file{{ droppedFiles.length === 1 ? "" : "s" }} · {{ formatBytes(totalFileSize) }} to
-          {{ displayPeerAlias(pendingSendPeer) }}?
+          Send {{ selectionSummary }} to {{ displayPeerAlias(pendingSendPeer) }}?
         </p>
 
-        <div class="incoming-files send-files-preview">
+        <pre v-if="selectedClipboard" class="clipboard-preview">{{ selectedClipboard.text }}</pre>
+        <div v-else class="incoming-files send-files-preview">
           <div v-for="file in droppedFiles.slice(0, 5)" :key="file.path || file.name" class="file-pill">
             <span>{{ file.name }}</span>
             <strong>{{ formatBytes(file.size) }}</strong>
@@ -652,30 +746,43 @@ onUnmounted(() => {
     </div>
 
     <div v-if="pendingOffer" class="dialog-backdrop">
-      <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="Receive files">
+      <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="Receive transfer">
         <div class="dialog-title">
           <div>
             <p class="eyebrow">Incoming Transfer</p>
-            <h2>Receive Files?</h2>
+            <h2>{{ pendingOffer.clipboard_text ? "Incoming Clipboard Text" : "Receive Files?" }}</h2>
           </div>
         </div>
 
-        <p class="incoming-summary">
-          {{ pendingOffer.sender_alias }} wants to send {{ pendingOffer.files.length }}
-          file{{ pendingOffer.files.length === 1 ? "" : "s" }} · {{ formatBytes(pendingOffer.total_size) }}.
-        </p>
-
-        <div class="incoming-files">
-          <div v-for="file in pendingOffer.files.slice(0, 4)" :key="file.index" class="file-pill">
-            <span>{{ file.name }}</span>
-            <strong>{{ formatBytes(file.size) }}</strong>
+        <template v-if="pendingOffer.clipboard_text">
+          <p class="incoming-summary">
+            {{ pendingOffer.sender_alias }} wants to send clipboard text · {{ formatBytes(pendingOffer.clipboard_text.size) }}.
+          </p>
+          <pre class="clipboard-preview">{{ pendingOffer.clipboard_text.text }}</pre>
+          <div class="dialog-actions">
+            <button class="ghost-button" type="button" @click="decideIncomingOffer(false)">Decline</button>
+            <button class="primary-button" type="button" @click="copyIncomingClipboardText">Copy</button>
           </div>
-        </div>
+        </template>
 
-        <div class="dialog-actions">
-          <button class="ghost-button" type="button" @click="decideIncomingOffer(false)">Decline</button>
-          <button class="primary-button" type="button" @click="decideIncomingOffer(true)">Accept</button>
-        </div>
+        <template v-else>
+          <p class="incoming-summary">
+            {{ pendingOffer.sender_alias }} wants to send {{ pendingOffer.files.length }}
+            file{{ pendingOffer.files.length === 1 ? "" : "s" }} · {{ formatBytes(pendingOffer.total_size) }}.
+          </p>
+
+          <div class="incoming-files">
+            <div v-for="file in pendingOffer.files.slice(0, 4)" :key="file.index" class="file-pill">
+              <span>{{ file.name }}</span>
+              <strong>{{ formatBytes(file.size) }}</strong>
+            </div>
+          </div>
+
+          <div class="dialog-actions">
+            <button class="ghost-button" type="button" @click="decideIncomingOffer(false)">Decline</button>
+            <button class="primary-button" type="button" @click="decideIncomingOffer(true)">Accept</button>
+          </div>
+        </template>
       </section>
     </div>
 
@@ -1124,11 +1231,17 @@ h1 {
   font-size: 0.88rem;
 }
 
-.drop-clear-button {
+.drop-actions {
   position: absolute;
   z-index: 2;
   top: 28px;
   right: 28px;
+  display: flex;
+  gap: 8px;
+}
+
+.drop-clear-button {
+  position: relative;
 }
 
 .file-stack {
@@ -1160,6 +1273,11 @@ h1 {
 
 .selected-file-pill {
   padding-right: 30px;
+}
+
+.clipboard-pill {
+  border: 1px solid rgba(154, 77, 46, 0.22);
+  background: rgba(255, 244, 223, 0.9);
 }
 
 .file-remove-button {
@@ -1403,6 +1521,20 @@ h1 {
   max-height: 190px;
   overflow-y: auto;
   padding-right: 6px;
+}
+
+.clipboard-preview {
+  max-height: 240px;
+  overflow: auto;
+  margin: 12px 0 0;
+  padding: 14px;
+  border: 1px solid rgba(35, 48, 47, 0.1);
+  border-radius: 16px;
+  color: #23302f;
+  background: rgba(255, 255, 255, 0.72);
+  font: 0.9rem/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .settings-dialog label {
