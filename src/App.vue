@@ -86,6 +86,16 @@ interface UploadResult {
   size: number;
 }
 
+interface ReceiveTransferStatusEvent {
+  transfer_id: string;
+  status: "receiving" | "complete";
+  file_name: string;
+  saved_name: string | null;
+  file_index: number;
+  file_count: number;
+  size: number;
+}
+
 const localInfo = reactive({
   ipv6: "Detecting",
   ipv4: "Detecting",
@@ -110,6 +120,7 @@ const droppedFiles = ref<SelectedFile[]>([]);
 const peerMessage = ref("");
 const toastMessage = ref("");
 const pendingOffer = ref<TransferOffer | null>(null);
+const receiveStatus = ref<ReceiveTransferStatusEvent | null>(null);
 const pendingDeletePeer = ref<Peer | null>(null);
 const pendingSendPeer = ref<Peer | null>(null);
 const isSendingOffer = ref(false);
@@ -117,6 +128,7 @@ const isManualRefreshingPeers = ref(false);
 let probeTimer: number | undefined;
 let toastTimer: number | undefined;
 let unlistenTransferOffer: UnlistenFn | undefined;
+let unlistenReceiveStatus: UnlistenFn | undefined;
 let unlistenDragDrop: UnlistenFn | undefined;
 
 const newPeer = reactive({
@@ -138,6 +150,13 @@ const selectionSummary = computed(() => {
   }
 
   return `${droppedFiles.value.length} file${droppedFiles.value.length === 1 ? "" : "s"} · ${formatBytes(totalFileSize.value)}`;
+});
+const receiveStatusText = computed(() => {
+  if (!receiveStatus.value) return "";
+
+  const status = receiveStatus.value.status === "receiving" ? "Receiving" : "Received";
+  const name = receiveStatus.value.saved_name ?? receiveStatus.value.file_name;
+  return `${status} ${receiveStatus.value.file_index}/${receiveStatus.value.file_count}: ${name} · ${formatBytes(receiveStatus.value.size)}`;
 });
 
 function showToast(message: string) {
@@ -515,7 +534,8 @@ async function copyIncomingClipboardText() {
 async function decideIncomingOffer(accepted: boolean, successMessage?: string) {
   if (!pendingOffer.value) return;
 
-  const transferId = pendingOffer.value.transfer_id;
+  const offer = pendingOffer.value;
+  const transferId = offer.transfer_id;
   try {
     await invoke("decide_transfer", {
       decision: {
@@ -523,6 +543,17 @@ async function decideIncomingOffer(accepted: boolean, successMessage?: string) {
         accepted,
       },
     });
+    if (accepted && offer.files.length > 0) {
+      receiveStatus.value = {
+        transfer_id: transferId,
+        status: "receiving",
+        file_name: offer.files[0].name,
+        saved_name: null,
+        file_index: 1,
+        file_count: offer.files.length,
+        size: offer.files[0].size,
+      };
+    }
     showToast(successMessage ?? (accepted ? "Transfer request accepted. Waiting for upload." : "Transfer request declined."));
   } catch (error) {
     showToast(`Failed to handle transfer request: ${String(error)}`);
@@ -552,6 +583,9 @@ onMounted(async () => {
   unlistenTransferOffer = await listen<TransferOffer>("transfer-offer", (event) => {
     pendingOffer.value = event.payload;
   });
+  unlistenReceiveStatus = await listen<ReceiveTransferStatusEvent>("receive-transfer-status", (event) => {
+    receiveStatus.value = event.payload;
+  });
   unlistenDragDrop = await getCurrentWebview().onDragDropEvent((event) => {
     if (event.payload.type === "drop") {
       applyDroppedPaths(event.payload.paths);
@@ -569,6 +603,9 @@ onUnmounted(() => {
   }
   if (unlistenTransferOffer) {
     unlistenTransferOffer();
+  }
+  if (unlistenReceiveStatus) {
+    unlistenReceiveStatus();
   }
   if (unlistenDragDrop) {
     unlistenDragDrop();
@@ -611,6 +648,10 @@ onUnmounted(() => {
       </header>
 
       <p v-if="loadError" class="error-banner">{{ loadError }}</p>
+      <div v-if="receiveStatus" class="receive-status-card">
+        <span :class="['receive-status-dot', receiveStatus.status]"></span>
+        <span>{{ receiveStatusText }}</span>
+      </div>
 
       <section
         class="drop-zone"
@@ -1118,6 +1159,30 @@ h1 {
   color: #8a3f27;
   background: rgba(255, 238, 222, 0.76);
   font-weight: 800;
+}
+
+.receive-status-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -10px 2px 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(37, 59, 56, 0.14);
+  border-radius: 16px;
+  color: #253b38;
+  background: rgba(227, 238, 224, 0.76);
+  font-weight: 900;
+}
+
+.receive-status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #d8a23d;
+}
+
+.receive-status-dot.complete {
+  background: #48a46b;
 }
 
 .toast-bubble {

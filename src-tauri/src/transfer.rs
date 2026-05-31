@@ -55,6 +55,24 @@ pub struct TransferOfferResponse {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiveTransferStatusKind {
+    Receiving,
+    Complete,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiveTransferStatusEvent {
+    pub transfer_id: Uuid,
+    pub status: ReceiveTransferStatusKind,
+    pub file_name: String,
+    pub saved_name: Option<String>,
+    pub file_index: u32,
+    pub file_count: u32,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadResult {
     pub ok: bool,
@@ -149,6 +167,7 @@ pub async fn handle_offer(
 }
 
 pub async fn upload_file(
+    app: AppHandle,
     state: std::sync::Arc<TransferState>,
     transfer_id: Uuid,
     file_index: u32,
@@ -171,11 +190,22 @@ pub async fn upload_file(
         return Err("上传 token 无效".to_string());
     }
 
+    let file_count = session.files.len() as u32;
     let expected_file = session
         .files
         .iter()
         .find(|file| file.index == file_index)
         .ok_or_else(|| "文件 index 无效".to_string())?;
+    let _ = app.emit(
+        "receive-transfer-status",
+        receive_status_event(
+            transfer_id,
+            ReceiveTransferStatusKind::Receiving,
+            expected_file,
+            file_count,
+            None,
+        ),
+    );
     let saved_name = sanitized_file_name(&expected_file.name);
     let save_path = unique_save_path(&config::load_or_create_config()?.save_dir, &saved_name)?;
     let mut file = tokio::fs::File::create(&save_path)
@@ -201,13 +231,25 @@ pub async fn upload_file(
         return Err("上传大小与预期不一致".to_string());
     }
 
+    let saved_name = save_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&saved_name)
+        .to_string();
+    let _ = app.emit(
+        "receive-transfer-status",
+        receive_status_event(
+            transfer_id,
+            ReceiveTransferStatusKind::Complete,
+            expected_file,
+            file_count,
+            Some(saved_name.clone()),
+        ),
+    );
+
     Ok(UploadResult {
         ok: true,
-        saved_name: save_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&saved_name)
-            .to_string(),
+        saved_name,
         size: written,
     })
 }
@@ -313,6 +355,24 @@ pub fn decide_transfer(state: &TransferState, decision: TransferDecision) -> Res
     }
 }
 
+fn receive_status_event(
+    transfer_id: Uuid,
+    status: ReceiveTransferStatusKind,
+    file: &TransferFileMeta,
+    file_count: u32,
+    saved_name: Option<String>,
+) -> ReceiveTransferStatusEvent {
+    ReceiveTransferStatusEvent {
+        transfer_id,
+        status,
+        file_name: file.name.clone(),
+        saved_name,
+        file_index: file.index + 1,
+        file_count,
+        size: file.size,
+    }
+}
+
 fn parse_bearer_token(headers: &HeaderMap) -> Result<String, String> {
     let value = headers
         .get("authorization")
@@ -392,5 +452,35 @@ impl TransferOfferResponse {
             expires_in: None,
             reason: Some(reason.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receive_status_event_uses_one_based_file_index() {
+        let file = TransferFileMeta {
+            index: 0,
+            name: "report.pdf".to_string(),
+            size: 42,
+        };
+
+        let event = receive_status_event(
+            Uuid::nil(),
+            ReceiveTransferStatusKind::Receiving,
+            &file,
+            3,
+            None,
+        );
+
+        assert_eq!(event.transfer_id, Uuid::nil());
+        assert_eq!(event.status, ReceiveTransferStatusKind::Receiving);
+        assert_eq!(event.file_name, "report.pdf");
+        assert_eq!(event.saved_name, None);
+        assert_eq!(event.file_index, 1);
+        assert_eq!(event.file_count, 3);
+        assert_eq!(event.size, 42);
     }
 }

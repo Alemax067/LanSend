@@ -169,7 +169,7 @@ async fn upload_file(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<transfer::UploadResult>, String> {
-    transfer::upload_file(state.transfer_state, transfer_id, file_index, headers, body)
+    transfer::upload_file(state.app, state.transfer_state, transfer_id, file_index, headers, body)
         .await
         .map(Json)
 }
